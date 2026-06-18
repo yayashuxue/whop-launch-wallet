@@ -531,11 +531,20 @@ function ApiTimeline({ events }: { events: LaunchEvent[] }) {
           <EmptyState text="Actions will stream here with method, path, and latency." dark />
         ) : (
           events.map((event) => (
-            <div key={event.id} className="grid grid-cols-[64px_1fr_auto] items-center gap-3 rounded-lg bg-white/10 px-3 py-2 font-mono text-sm">
+            <div key={event.id} className="grid grid-cols-[auto_56px_1fr_auto] items-center gap-3 rounded-lg bg-white/10 px-3 py-2 font-mono text-sm">
+              <span
+                className={`rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wider ${
+                  event.mode === "live"
+                    ? "bg-[#c1fa81] text-[#151515]"
+                    : "bg-[#fa4616] text-white"
+                }`}
+              >
+                {event.mode === "live" ? "LIVE" : "DEMO"}
+              </span>
               <span className="text-[#c1fa81]">{event.method}</span>
               <span className="truncate">{event.path}</span>
-              <span className="text-right text-[#b6b5b0]">{event.status} · {event.ms}ms</span>
-              <span className="col-span-3 text-xs text-[#b6b5b0]">{event.summary}</span>
+              <span className="text-right text-[#b6b5b0]">{event.status || "—"} · {event.ms}ms</span>
+              <span className="col-span-4 text-xs text-[#b6b5b0]">{event.summary}</span>
             </div>
           ))
         )}

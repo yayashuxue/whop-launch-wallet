@@ -110,7 +110,7 @@ function logTransaction(transaction: Omit<LaunchTransaction, "id" | "at">) {
   ].slice(0, 24);
 }
 
-async function callWhop<T>(path: string, method: string, body?: unknown) {
+async function callWhop<T>(path: string, method: string, body?: unknown, summaryOverride?: string) {
   const started = Date.now();
   try {
     const result = await whop<T>(path, { method, body });
@@ -120,12 +120,12 @@ async function callWhop<T>(path: string, method: string, body?: unknown) {
       status: 200,
       ms: Date.now() - started,
       mode: "live",
-      summary: "Whop API call completed",
+      summary: summaryOverride ?? "Whop API call completed",
     });
     state.mode = "live";
     return result;
   } catch (error) {
-    if (error instanceof WhopApiError && error.status === 500) {
+    if (error instanceof WhopApiError && error.status === 500 && typeof error.body === "object" && error.body && "error" in (error.body as Record<string, unknown>) && (error.body as { error?: string }).error === "WHOP_API_KEY is not set") {
       logEvent({
         method,
         path,
@@ -137,9 +137,21 @@ async function callWhop<T>(path: string, method: string, body?: unknown) {
       state.mode = "demo";
       return null;
     }
+    if (error instanceof WhopApiError) {
+      logEvent({
+        method,
+        path,
+        status: error.status,
+        ms: Date.now() - started,
+        mode: "live",
+        summary: `Whop API error ${error.status}: ${typeof error.body === "object" ? JSON.stringify(error.body).slice(0, 140) : String(error.body)}`,
+      });
+    }
     throw error;
   }
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export function getLaunchState() {
   return state;
@@ -171,19 +183,56 @@ export async function mutateLaunch(input: LaunchAction) {
     const amountUsd = Number(input.amountUsd ?? 1500);
     const destination = state.accountId ?? id("acct");
     state.accountId = destination;
-    const deposit = await callWhop<{ deposit_address?: { evm?: string } }>("/deposits", "POST", {
-      destination,
-      amount: amountUsd,
-    });
-    state.depositAddress =
-      deposit?.deposit_address?.evm ?? "0x3A0F6d15b8fB7E7b7f63a17C4aC7d9D2aC1a9F01";
-    state.balanceUsd += amountUsd;
-    logTransaction({
-      kind: "deposit",
-      label: "USDC launch float",
-      amountUsd,
-      status: "posted",
-    });
+
+    // Whop's deposit_address.evm provisions async; poll a few times in-request
+    // before falling back to a provisioning state. Reference: bot.ts getDepositAddress().
+    let deposit: { deposit_address?: { evm?: string } } | null = null;
+    let liveAddress: string | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      deposit = await callWhop<{ deposit_address?: { evm?: string } }>(
+        "/deposits",
+        "POST",
+        { destination, amount: amountUsd },
+        attempt === 0 ? "Whop API call completed" : `Whop API retry ${attempt + 1}/3 (deposit_address provisioning)`,
+      );
+      liveAddress = deposit?.deposit_address?.evm ?? null;
+      if (liveAddress || deposit === null) break;
+      await sleep(1200);
+    }
+
+    if (deposit === null) {
+      // demo mode: visibly fake address so it's obvious nothing real is happening
+      state.depositAddress = "0xDEM0DEM0DEM0DEM0DEM0DEM0DEM0DEM0DEM0DEM0";
+      state.balanceUsd += amountUsd;
+      logTransaction({
+        kind: "deposit",
+        label: "Simulated USDC launch float (demo)",
+        amountUsd,
+        status: "posted",
+      });
+    } else if (liveAddress) {
+      state.depositAddress = liveAddress;
+      // Credit demo balance so the rest of the flow can run; explicitly mark
+      // the transaction as pending real on-chain settlement.
+      state.balanceUsd += amountUsd;
+      logTransaction({
+        kind: "deposit",
+        label: `Send ${amountUsd} USDC to ${liveAddress.slice(0, 10)}… to settle (demo-credited)`,
+        amountUsd,
+        status: "pending",
+      });
+    } else {
+      // Real API responded, but deposit_address.evm is still provisioning.
+      // Credit demo balance so the demo flow can proceed; flag honestly.
+      state.depositAddress = "provisioning";
+      state.balanceUsd += amountUsd;
+      logTransaction({
+        kind: "deposit",
+        label: `Whop deposit address provisioning — demo-credited $${amountUsd} so flow can continue`,
+        amountUsd,
+        status: "pending",
+      });
+    }
     return state;
   }
 
@@ -198,12 +247,34 @@ export async function mutateLaunch(input: LaunchAction) {
       last4: last4(),
       status: "draft" as const,
     };
-    await callWhop("/cards", "POST", {
-      account_id: state.accountId,
-      label: card.label,
-      spend_limit_usd: card.limitUsd,
-      metadata: { vendor: card.vendor, metric: card.metric },
-    });
+    // Virtual-card endpoint shape is documented as "coming soon"; if Whop returns
+    // 404/422 we surface the issue in the trace but still complete the demo.
+    try {
+      await callWhop(
+        "/cards",
+        "POST",
+        {
+          account_id: state.accountId,
+          label: card.label,
+          spend_limit_usd: card.limitUsd,
+          metadata: { vendor: card.vendor, metric: card.metric },
+        },
+        "POST /cards — virtual card issuance (Whop preview endpoint)",
+      );
+    } catch (error) {
+      if (error instanceof WhopApiError) {
+        logEvent({
+          method: "POST",
+          path: "/cards",
+          status: 0,
+          ms: 0,
+          mode: "demo",
+          summary: `Card endpoint not live yet (${error.status}); demo card recorded locally`,
+        });
+      } else {
+        throw error;
+      }
+    }
     state.cards = state.cards.map((entry) =>
       entry.id === card.id ? { ...entry, status: "active" } : entry,
     );
@@ -220,9 +291,19 @@ export async function mutateLaunch(input: LaunchAction) {
     const amountUsd = Number(input.amountUsd ?? 899);
     state.revenueUsd += amountUsd;
     state.balanceUsd += amountUsd;
+    // record_sale is wired to Whop checkout webhook in production; here we log
+    // a simulated webhook event so the trace clearly says it's not a live call.
+    logEvent({
+      method: "EVENT",
+      path: "whop.checkout.completed",
+      status: 0,
+      ms: 0,
+      mode: "demo",
+      summary: `Simulated Whop checkout webhook (+$${amountUsd}); real wiring is webhook-driven`,
+    });
     logTransaction({
       kind: "sale",
-      label: "Whop checkout revenue",
+      label: "Whop checkout revenue (simulated webhook)",
       amountUsd,
       status: "settled",
     });
