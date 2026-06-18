@@ -149,7 +149,7 @@ export async function mutateLaunch(input: LaunchAction) {
   if (input.action === "create_wallet") {
     if (!state.accountId) {
       const account = await callWhop<{ id: string }>("/accounts", "POST", {
-        email: `launch+${Date.now()}@whop.demo`,
+        email: `launch-${Date.now()}@example.com`,
         metadata: { product: "launch-wallet", launch: state.launchName },
       });
       state.accountId = account?.id ?? id("acct");
