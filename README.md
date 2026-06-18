@@ -79,6 +79,12 @@ WHOP_API_BASE=https://api.whop.com/api/v1
 
 Without `WHOP_API_KEY`, the app runs in demo-safe mode and records each intended Whop call in the API trace.
 
+On Julie's laptop, the default `/usr/local/bin/node` is v18 and will fail with Next 16. Use the local nvm Node:
+
+```bash
+PATH=/Users/jingyushi/.local/share/nvm/v23.11.0/bin:$PATH node_modules/next/dist/bin/next dev -p 3017
+```
+
 ## Verification
 
 Completed locally:
